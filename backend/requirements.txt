@@ -4,3 +4,7 @@ torch
 torchvision
 pillow
 pydantic
+passlib[bcrypt]
+python-jose
+pymongo
+python-multipart
