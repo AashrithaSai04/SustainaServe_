@@ -1,109 +1,148 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
 import torch
 import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
+from torchvision import transforms
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-import io
+from io import BytesIO
+import pymongo
+from datetime import datetime
+import os
 
-# ----------------------------
-# Model Definition (same as training)
-# ----------------------------
+# -----------------------------
+# MongoDB Connection
+# -----------------------------
+# Connect using your Compass connection string
+# Replace with your own connection string if different
+mongo_client = pymongo.MongoClient("mongodb://localhost:27017/")
+db = mongo_client["food_classification_db"]
+collection = db["predictions"]
+
+# -----------------------------
+# Model Definition
+# -----------------------------
 class MultimodalModel(nn.Module):
-    def __init__(self, metadata_dim):
-        super().__init__()
-        # Pretrained image model
-        self.image_model = models.resnet18(pretrained=False)
-        num_ftrs = self.image_model.fc.in_features
-        self.image_model.fc = nn.Identity()  # remove final layer
-
-        # Metadata model
-        self.meta_fc = nn.Sequential(
-    nn.Linear(4, 32),  # use 4 instead of 2
-    nn.ReLU(),
-)
-
-
-        # Combined classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(num_ftrs + 32, 128),
+    def __init__(self):
+        super(MultimodalModel, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 2)
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten()
         )
 
-    def forward(self, img, meta):
-        img_feat = self.image_model(img)
-        meta_feat = self.meta_fc(meta)
-        combined = torch.cat([img_feat, meta_feat], dim=1)
+        # ✅ 4 metadata features to fix size mismatch
+        self.meta_fc = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(32 * 56 * 56 + 16, 64),  # flatten size depends on input image
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, image, metadata):
+        img_features = self.cnn(image)
+        meta_features = self.meta_fc(metadata)
+        combined = torch.cat((img_features, meta_features), dim=1)
         out = self.classifier(combined)
         return out
 
 
-# ----------------------------
-# FastAPI app setup
-# ----------------------------
+# -----------------------------
+# Model Loading
+# -----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = MultimodalModel().to(device)
+
+try:
+    model.load_state_dict(torch.load("fresh_stale_model.pth", map_location=device))
+    print("✅ Model loaded successfully!")
+except Exception as e:
+    print("⚠️ Warning: Could not load model weights ->", e)
+
+model.eval()
+
+# -----------------------------
+# FastAPI App Setup
+# -----------------------------
 app = FastAPI()
 
-# Allow frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # change this to your frontend URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Device setup
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load model
-model = MultimodalModel(metadata_dim=2)  # assuming 2 metadata values
-model.load_state_dict(torch.load("fresh_stale_model.pth", map_location=device))
-model.to(device)
-model.eval()
-
-# Image preprocessing
+# -----------------------------
+# Preprocessing
+# -----------------------------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
 ])
 
-# ----------------------------
-# Routes
-# ----------------------------
 
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
 def root():
     return {"message": "Food classification API running"}
 
+
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    storage_type: int = Form(...),
-    food_type: int = Form(...)
+    temperature: float = Form(...),
+    humidity: float = Form(...),
+    light: float = Form(...),
+    air_quality: float = Form(...)
 ):
     try:
         # Read image
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_bytes = await file.read()
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
         image = transform(image).unsqueeze(0).to(device)
 
         # Metadata tensor
-        metadata = torch.tensor([[storage_type, food_type]], dtype=torch.float32).to(device)
+        metadata = torch.tensor([[temperature, humidity, light, air_quality]], dtype=torch.float32).to(device)
 
-        # Predict
+        # Model prediction
         with torch.no_grad():
-            outputs = model(image, metadata)
-            preds = torch.argmax(outputs, dim=1).item()
-            label = "fresh" if preds == 0 else "stale"
+            output = model(image, metadata)
+            _, predicted = torch.max(output, 1)
+            label = "fresh" if predicted.item() == 0 else "stale"
 
-        return {"prediction": label}
+        # Store in MongoDB
+        data = {
+            "filename": file.filename,
+            "temperature": temperature,
+            "humidity": humidity,
+            "light": light,
+            "air_quality": air_quality,
+            "prediction": label,
+            "timestamp": datetime.now().isoformat()
+        }
+        collection.insert_one(data)
+
+        return {"prediction": label, "stored_in_mongodb": True}
 
     except Exception as e:
         return {"error": str(e)}
+
+
+# -----------------------------
+# Run Command
+# -----------------------------
+# Run using: uvicorn app:app --reload
